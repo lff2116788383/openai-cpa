@@ -80,6 +80,11 @@ USE_PROXY_FOR_EMAIL = _c.get("use_proxy_for_email", False)
 ENABLE_EMAIL_MASKING = _c.get("enable_email_masking", True)
 TOKEN_OUTPUT_DIR = _c.get("token_output_dir", "").strip()
 
+LOGIN_DELAY_MIN = _c.get("login_delay_min", 5)
+LOGIN_DELAY_MAX = _c.get("login_delay_max", 15)
+
+ENABLE_EMAIL_MASKING = _c.get("enable_email_masking", True)
+
 ENABLE_MULTI_THREAD_REG = _c.get("enable_multi_thread_reg", False)
 REG_THREADS = _c.get("reg_threads", 3)
 
@@ -1033,13 +1038,9 @@ def _extract_next_url(data: Dict[str, Any]) -> str:
         "workspace": "https://auth.openai.com/workspace"
     }
     return mapping.get(page_type, "")
-def run(proxy: Optional[str]) -> tuple:
-    processed_mails = set()
-    current_url = ""
-    if proxy and proxy.startswith("socks5://"):
-        proxy = proxy.replace("socks5://", "socks5h://")
-    proxies = {"http": proxy, "https": proxy} if proxy else None
-    
+
+def perform_registration(proxies: Any, processed_mails: set) -> tuple:
+    """注册账号的主流程，返回状态及上下文数据"""
     s_reg = requests.Session(proxies=proxies, impersonate="chrome110")
     s_reg.timeout = 30
 
@@ -1055,248 +1056,284 @@ def run(proxy: Optional[str]) -> tuple:
             print(f"[{ts()}] [INFO] 节点测活成功！地区: {loc} | 延迟: {elapsed:.2f}s")
         except Exception as e:
             print(f"[{ts()}] [ERROR] 代理网络检查失败: {e}")
-            return None, None
+            return "fail", None
 
     email, email_jwt = get_email_and_token(proxies)
-    if not email: return None, None
+    if not email: return "fail", None
 
     password = _generate_password()
     print(f"[{ts()}] [INFO] 提交注册信息 (密码: {password[:4]}****)")
 
     oauth_reg = generate_oauth_url()
+    s_reg.get(oauth_reg.auth_url, proxies=proxies, verify=True, timeout=15)
+    did = s_reg.cookies.get("oai-did") or ""
+    
+    if not did:
+        print(f"[{ts()}] [WARNING] 未获取到 oai-did，节点环境可能被关注。")
+    
+    print(f"[{ts()}] [INFO] 正在计算风控算力挑战...")
+    sentinel_reg = _get_sentinel_token(s_reg, "authorize_continue", proxies)
+    
+    signup_resp = _post_with_retry(
+        s_reg, "https://auth.openai.com/api/accounts/authorize/continue",
+        headers=_oai_headers(did, {
+            "Referer": "https://auth.openai.com/create-account", 
+            "openai-sentinel-token": sentinel_reg,
+            "content-type": "application/json"
+        }),
+        json_body={"username":{"value":email,"kind":"email"},"screen_hint":"signup"},
+        proxies=proxies
+    )
+    
+    # if signup_resp.status_code == 403:
+        # print(f"[{ts()}] [WARNING] {email} 注册请求触发 403 拦截，稍作等待后重试...")
+        # return "retry_403", None
+    if signup_resp.status_code != 200:
+        print(f"[{ts()}] [ERROR] 注册表单提交失败，中断当前流程: {signup_resp.text}")
+        return "fail", None
+
+    pwd_resp = _post_with_retry(
+        s_reg, "https://auth.openai.com/api/accounts/user/register",
+        headers=_oai_headers(did, {
+            "Referer": "https://auth.openai.com/create-account/password", 
+            "openai-sentinel-token": sentinel_reg,
+            "content-type": "application/json"
+        }),
+        json_body={"password": password, "username": email},
+        proxies=proxies
+    )
+    
+    if pwd_resp.status_code != 200:
+        print(f"[{ts()}] [ERROR] 密码注册环节异常: {pwd_resp.text}")
+        return "fail", None
+
     try:
-        s_reg.get(oauth_reg.auth_url, proxies=proxies, verify=True, timeout=15)
-        did = s_reg.cookies.get("oai-did") or ""
-        
-        if not did:
-            print(f"[{ts()}] [WARNING] 未获取到 oai-did，节点环境可能被关注。")
-        
-        print(f"[{ts()}] [INFO] 正在计算风控算力挑战...")
-        sentinel_reg = _get_sentinel_token(s_reg, "authorize_continue", proxies)
-        
-        signup_resp = _post_with_retry(
-            s_reg, "https://auth.openai.com/api/accounts/authorize/continue",
-            headers=_oai_headers(did, {
-                "Referer": "https://auth.openai.com/create-account", 
-                "openai-sentinel-token": sentinel_reg,
-                "content-type": "application/json"
-            }),
-            json_body={"username":{"value":email,"kind":"email"},"screen_hint":"signup"},
-            proxies=proxies
-        )
-        
-        # if signup_resp.status_code == 403:
-            # print(f"[{ts()}] [WARNING] {email} 注册请求触发 403 拦截，稍作等待后重试...")
-            # return "retry_403", None
-        if signup_resp.status_code != 200:
-            print(f"[{ts()}] [ERROR] 注册表单提交失败，中断当前流程: {signup_resp.text}")
-            return None, None
+        reg_json = pwd_resp.json()
+        need_otp = "verify" in reg_json.get("continue_url", "") or "otp" in (reg_json.get("page") or {}).get("type", "")
+    except Exception:
+        need_otp = False
 
-        pwd_resp = _post_with_retry(
-            s_reg, "https://auth.openai.com/api/accounts/user/register",
-            headers=_oai_headers(did, {
-                "Referer": "https://auth.openai.com/create-account/password", 
-                "openai-sentinel-token": sentinel_reg,
-                "content-type": "application/json"
-            }),
-            json_body={"password": password, "username": email},
-            proxies=proxies
-        )
-        
-        if pwd_resp.status_code != 200:
-            print(f"[{ts()}] [ERROR] 密码注册环节异常: {pwd_resp.text}")
-            return None, None
-
-        try:
-            reg_json = pwd_resp.json()
-            need_otp = "verify" in reg_json.get("continue_url", "") or "otp" in (reg_json.get("page") or {}).get("type", "")
-        except Exception:
-            need_otp = False
-
-        if need_otp:
-            otp_url = reg_json.get("continue_url", "")
-            if otp_url:
-                _post_with_retry(
-                    s_reg, otp_url if otp_url.startswith("http") else f"https://auth.openai.com{otp_url}", 
-                    headers={
-                        "Referer": "https://auth.openai.com/create-account/password",
-                        "openai-sentinel-token": sentinel_reg, 
-                        "content-type": "application/json"
-                    }, 
-                    json_body={}, proxies=proxies, timeout=30
-                )
-            
-            code = ""
-            for resend_attempt in range(max(1, MAX_OTP_RETRIES)):
-                if resend_attempt > 0:
-                    print(f"\n[{ts()}] [INFO] 正在重试 {resend_attempt}/5...")
-                    try:
-                        _post_with_retry(
-                            s_reg, "https://auth.openai.com/api/accounts/email-otp/resend", 
-                            headers={"openai-sentinel-token": sentinel_reg, "content-type": "application/json"}, 
-                            json_body={}, proxies=proxies, timeout=15
-                        )
-                        time.sleep(2)  
-                    except Exception as e:
-                        print(f"[{ts()}] [WARNING] 重新发送请求异常: {e}")
-                
-                code = get_oai_code(email, jwt=email_jwt, proxies=proxies, processed_mail_ids=processed_mails)
-                if code: break
-
-            if not code:
-                print(f"[{ts()}] [ERROR] 重试次数上限，丢弃当前邮箱。")
-                return None, None
-            
-            code_resp = _post_with_retry(
-                s_reg, "https://auth.openai.com/api/accounts/email-otp/validate", 
+    if need_otp:
+        otp_url = reg_json.get("continue_url", "")
+        if otp_url:
+            _post_with_retry(
+                s_reg, otp_url if otp_url.startswith("http") else f"https://auth.openai.com{otp_url}", 
                 headers={
-                    "Referer": "https://auth.openai.com/email-verification",
+                    "Referer": "https://auth.openai.com/create-account/password",
                     "openai-sentinel-token": sentinel_reg, 
                     "content-type": "application/json"
                 }, 
-                json_body={"code": code}, proxies=proxies
+                json_body={}, proxies=proxies, timeout=30
             )
-            if code_resp.status_code != 200:
-                print(f"[{ts()}] [ERROR] 验证码校验未通过: {code_resp.text}")
-                return None, None
-
-        user_info = generate_random_user_info()
-        print(f"[{ts()}] [INFO] 初始化账户基础信息 (昵称: {user_info['name']}, 生日: {user_info['birthdate']})...")
-        user_info = generate_random_user_info()
-        create_account_resp = _post_with_retry(
-            s_reg, "https://auth.openai.com/api/accounts/create_account", 
-            headers=_oai_headers(did, {"Referer": "https://auth.openai.com/about-you", "content-type": "application/json"}), 
-            json_body=user_info, proxies=proxies
-        )
         
-        if create_account_resp.status_code != 200:
-            print(f"[{ts()}] [ERROR] 账户创建受阻: 遭遇拦截，响应代码 {create_account_resp.status_code}")
-            return None, None
-
-        auth_cookie = s_reg.cookies.get("oai-client-auth-session")
-        has_workspace = False
-        if auth_cookie and "." in auth_cookie:
-            try:
-                claims = _decode_jwt_segment(auth_cookie.split(".")[0])
-                if claims.get("workspaces"): 
-                    has_workspace = True
-            except: pass
-        if has_workspace:
-            print(f"[{ts()}] [SUCCESS] 正在提取最终凭据...")
-            oauth_log = generate_oauth_url()
-            _, final_url = _follow_redirect_chain_local(s_reg, oauth_log.auth_url, proxies)
+        code = ""
+        for resend_attempt in range(max(1, MAX_OTP_RETRIES)):
+            if resend_attempt > 0:
+                print(f"\n[{ts()}] [INFO] 正在重试 {resend_attempt}/5...")
+                try:
+                    _post_with_retry(
+                        s_reg, "https://auth.openai.com/api/accounts/email-otp/resend", 
+                        headers={"openai-sentinel-token": sentinel_reg, "content-type": "application/json"}, 
+                        json_body={}, proxies=proxies, timeout=15
+                    )
+                    time.sleep(2)  
+                except Exception as e:
+                    print(f"[{ts()}] [WARNING] 重新发送请求异常: {e}")
             
-            if "code=" in final_url and "state=" in final_url:
-                return submit_callback_url(
-                    callback_url=final_url, 
-                    expected_state=oauth_log.state, 
-                    code_verifier=oauth_log.code_verifier, 
-                    proxies=proxies
-                ), password
+            code = get_oai_code(email, jwt=email_jwt, proxies=proxies, processed_mail_ids=processed_mails)
+            if code: break
+
+        if not code:
+            print(f"[{ts()}] [ERROR] 重试次数上限，丢弃当前邮箱。")
+            return "fail", None
+        
+        code_resp = _post_with_retry(
+            s_reg, "https://auth.openai.com/api/accounts/email-otp/validate", 
+            headers={
+                "Referer": "https://auth.openai.com/email-verification",
+                "openai-sentinel-token": sentinel_reg, 
+                "content-type": "application/json"
+            }, 
+            json_body={"code": code}, proxies=proxies
+        )
+        if code_resp.status_code != 200:
+            print(f"[{ts()}] [ERROR] 验证码校验未通过: {code_resp.text}")
+            return "fail", None
+
+    user_info = generate_random_user_info()
+    print(f"[{ts()}] [INFO] 初始化账户基础信息 (昵称: {user_info['name']}, 生日: {user_info['birthdate']})...")
+    user_info = generate_random_user_info()
+    create_account_resp = _post_with_retry(
+        s_reg, "https://auth.openai.com/api/accounts/create_account", 
+        headers=_oai_headers(did, {"Referer": "https://auth.openai.com/about-you", "content-type": "application/json"}), 
+        json_body=user_info, proxies=proxies
+    )
+    
+    if create_account_resp.status_code != 200:
+        print(f"[{ts()}] [ERROR] 账户创建受阻: 遭遇拦截，响应代码 {create_account_resp.status_code}")
+        return "fail", None
+
+    auth_cookie = s_reg.cookies.get("oai-client-auth-session")
+    has_workspace = False
+    if auth_cookie and "." in auth_cookie:
+        try:
+            claims = _decode_jwt_segment(auth_cookie.split(".")[0])
+            if claims.get("workspaces"): 
+                has_workspace = True
+        except: pass
+        
+    if has_workspace:
+        print(f"[{ts()}] [SUCCESS] 正在提取最终凭据...")
+        oauth_log = generate_oauth_url()
+        _, final_url = _follow_redirect_chain_local(s_reg, oauth_log.auth_url, proxies)
+        
+        if "code=" in final_url and "state=" in final_url:
+            result = submit_callback_url(
+                callback_url=final_url, 
+                expected_state=oauth_log.state, 
+                code_verifier=oauth_log.code_verifier, 
+                proxies=proxies
+            ), password
+            return "done", result
         else:
-            print(f"[{ts()}] [INFO] 基础信息建立完毕，执行静风控重登录...")
-            s_log = requests.Session(proxies=proxies, impersonate="chrome110")
-            oauth_log = generate_oauth_url()
+            return "fail", None
+    else:
+        return "need_login", (email, password, email_jwt)
+
+def perform_silent_login(email: str, password: str, email_jwt: str, proxies: Any, processed_mails: set) -> tuple:
+    """OAuth 静默重登录流程"""
+    print(f"[{ts()}] [INFO] 基础信息建立完毕，执行静默风控重登录...")
+    s_log = requests.Session(proxies=proxies, impersonate="chrome110")
+    oauth_log = generate_oauth_url()
+    
+    resp, current_url = _follow_redirect_chain_local(s_log, oauth_log.auth_url, proxies)
+    if "code=" in current_url and "state=" in current_url:
+        return submit_callback_url(callback_url=current_url, code_verifier=oauth_log.code_verifier, redirect_uri=oauth_log.redirect_uri, expected_state=oauth_log.state, proxies=proxies), password
+
+    sentinel_log = _get_sentinel_token(s_log, "authorize_continue", proxies)
+    login_start_resp = _post_with_retry(
+        s_log, "https://auth.openai.com/api/accounts/authorize/continue", 
+        headers=_oai_headers(s_log.cookies.get("oai-did") or "", {
+            "Referer": current_url,
+            "openai-sentinel-token": sentinel_log, 
+            "content-type": "application/json"
+        }), 
+        json_body={"username":{"value":email,"kind":"email"}}, proxies=proxies, allow_redirects=False
+    )
+    
+    pwd_page_url = str((login_start_resp.json() if login_start_resp.status_code == 200 else {}).get("continue_url") or "").strip()
+    resp, current_url = _follow_redirect_chain_local(s_log, pwd_page_url, proxies)
+
+    sentinel_pwd = _get_sentinel_token(s_log, "password_verify", proxies)
+    pwd_login_resp = _post_with_retry(
+        s_log, "https://auth.openai.com/api/accounts/password/verify", 
+        headers=_oai_headers(s_log.cookies.get("oai-did") or "", {
+            "Referer": current_url,
+            "openai-sentinel-token": sentinel_pwd, 
+            "content-type": "application/json"
+        }), 
+        json_body={"password": password}, proxies=proxies
+    )
+
+    pwd_json = pwd_login_resp.json() if pwd_login_resp.status_code == 200 else {}
+    next_url = str(pwd_json.get("continue_url") or "").strip()
+    if not next_url:
+        ptype = str(pwd_json.get("page", {}).get("type") or "").strip()
+        if ptype == "email_otp_verification": 
+            next_url = "https://auth.openai.com/email-verification"
+        elif ptype == "sign_in_with_chatgpt_codex_consent": 
+            next_url = "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
+        elif ptype == "workspace": 
+            next_url = "https://auth.openai.com/workspace"
+
+    resp, current_url = _follow_redirect_chain_local(s_log, next_url, proxies)
+    
+    if current_url.endswith("/email-verification"):
+        code2 = ""
+        time.sleep(5)
+        for resend_attempt in range(max(1, MAX_OTP_RETRIES)):
+            if resend_attempt > 0:
+                print(f"\n[{ts()}] [INFO] 正在重试 {resend_attempt}/5...")
+                try:
+                    _post_with_retry(
+                        s_log, "https://auth.openai.com/api/accounts/email-otp/resend", 
+                        headers=_oai_headers(s_log.cookies.get("oai-did") or "", {"Referer": current_url, "content-type": "application/json"}), 
+                        json_body={}, proxies=proxies, timeout=15
+                    )
+                    time.sleep(2)
+                except Exception as e:
+                    print(f"[{ts()}] [WARNING] 重新发送请求异常: {e}")
+        
+            code2 = get_oai_code(email, jwt=email_jwt, proxies=proxies, processed_mail_ids=processed_mails)
+            if code2: break 
+
+        if not code2:
+            print(f"[{ts()}] [ERROR] 重新发送后依然未收到验证码，彻底放弃。")
+            return None, None
             
-            resp, current_url = _follow_redirect_chain_local(s_log, oauth_log.auth_url, proxies)
-            if "code=" in current_url and "state=" in current_url:
-                return submit_callback_url(callback_url=current_url, code_verifier=oauth_log.code_verifier, redirect_uri=oauth_log.redirect_uri, expected_state=oauth_log.state, proxies=proxies), password
+        code2_resp = _post_with_retry(
+            s_log, "https://auth.openai.com/api/accounts/email-otp/validate", 
+            headers=_oai_headers(s_log.cookies.get("oai-did") or "", {"Referer": current_url, "content-type": "application/json"}), 
+            json_body={"code": code2}, proxies=proxies
+        )
+        if code2_resp.status_code != 200:
+            print(f"[{ts()}] [ERROR] 二次安全验证 OTP 校验失败: {code2_resp.text}")
+            return None, None
+        
+        next_url = str(code2_resp.json().get("continue_url") or "").strip()
+        resp, current_url = _follow_redirect_chain_local(s_log, next_url, proxies)
 
-            sentinel_log = _get_sentinel_token(s_log, "authorize_continue", proxies)
-            login_start_resp = _post_with_retry(
-                s_log, "https://auth.openai.com/api/accounts/authorize/continue", 
-                headers=_oai_headers(s_log.cookies.get("oai-did") or "", {
-                    "Referer": current_url,
-                    "openai-sentinel-token": sentinel_log, 
-                    "content-type": "application/json"
-                }), 
-                json_body={"username":{"value":email,"kind":"email"}}, proxies=proxies, allow_redirects=False
-            )
-            
-            pwd_page_url = str((login_start_resp.json() if login_start_resp.status_code == 200 else {}).get("continue_url") or "").strip()
-            resp, current_url = _follow_redirect_chain_local(s_log, pwd_page_url, proxies)
+    if "code=" in current_url and "state=" in current_url:
+        return submit_callback_url(callback_url=current_url, code_verifier=oauth_log.code_verifier, redirect_uri=oauth_log.redirect_uri, expected_state=oauth_log.state, proxies=proxies), password
 
-            sentinel_pwd = _get_sentinel_token(s_log, "password_verify", proxies)
-            pwd_login_resp = _post_with_retry(
-                s_log, "https://auth.openai.com/api/accounts/password/verify", 
-                headers=_oai_headers(s_log.cookies.get("oai-did") or "", {
-                    "Referer": current_url,
-                    "openai-sentinel-token": sentinel_pwd, 
-                    "content-type": "application/json"
-                }), 
-                json_body={"password": password}, proxies=proxies
-            )
-
-            pwd_json = pwd_login_resp.json() if pwd_login_resp.status_code == 200 else {}
-            next_url = str(pwd_json.get("continue_url") or "").strip()
-            if not next_url:
-                ptype = str(pwd_json.get("page", {}).get("type") or "").strip()
-                if ptype == "email_otp_verification": 
-                    next_url = "https://auth.openai.com/email-verification"
-                elif ptype == "sign_in_with_chatgpt_codex_consent": 
-                    next_url = "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
-                elif ptype == "workspace": 
-                    next_url = "https://auth.openai.com/workspace"
-
-            resp, current_url = _follow_redirect_chain_local(s_log, next_url, proxies)
-            
-            if current_url.endswith("/email-verification"):
-                code2 = ""
-                for resend_attempt in range(max(1, MAX_OTP_RETRIES)):
-                    if resend_attempt > 0:
-                        print(f"\n[{ts()}] [INFO] 正在重试 {resend_attempt}/5...")
-                        try:
-                            _post_with_retry(
-                                s_log, "https://auth.openai.com/api/accounts/email-otp/resend", 
-                                headers=_oai_headers(s_log.cookies.get("oai-did") or "", {"Referer": current_url, "content-type": "application/json"}), 
-                                json_body={}, proxies=proxies, timeout=15
-                            )
-                            time.sleep(2)
-                        except Exception as e:
-                            print(f"[{ts()}] [WARNING] 重新发送请求异常: {e}")
-                    
-                    code2 = get_oai_code(email, jwt=email_jwt, proxies=proxies, processed_mail_ids=processed_mails)
-                    if code2: break 
-
-                if not code2:
-                    print(f"[{ts()}] [ERROR] 重新发送后依然未收到验证码，彻底放弃。")
-                    return None, None
-                    
-                code2_resp = _post_with_retry(
-                    s_log, "https://auth.openai.com/api/accounts/email-otp/validate", 
+    if current_url.endswith("/consent") or current_url.endswith("/workspace"):
+        auth_cookie2 = s_log.cookies.get("oai-client-auth-session")
+        if auth_cookie2:
+            workspaces = _decode_jwt_segment(auth_cookie2.split(".")[0]).get("workspaces") or []
+            if workspaces:
+                select_resp = _post_with_retry(
+                    s_log, 
+                    "https://auth.openai.com/api/accounts/workspace/select", 
                     headers=_oai_headers(s_log.cookies.get("oai-did") or "", {"Referer": current_url, "content-type": "application/json"}), 
-                    json_body={"code": code2}, proxies=proxies
+                    json_body={"workspace_id": str(workspaces[0].get("id"))}, 
+                    proxies=proxies
                 )
-                if code2_resp.status_code != 200:
-                    print(f"[{ts()}] [ERROR] 二次安全验证 OTP 校验失败: {code2_resp.text}")
-                    return None, None
-                
-                next_url = str(code2_resp.json().get("continue_url") or "").strip()
-                resp, current_url = _follow_redirect_chain_local(s_log, next_url, proxies)
+                final_url = _extract_next_url(select_resp.json()) if select_resp.status_code == 200 else ""
+                _, final_loc = _follow_redirect_chain_local(s_log, final_url, proxies)
+                if "code=" in final_loc:
+                    return submit_callback_url(callback_url=final_loc, expected_state=oauth_log.state, code_verifier=oauth_log.code_verifier, proxies=proxies), password
 
-            if "code=" in current_url and "state=" in current_url:
-                return submit_callback_url(callback_url=current_url, code_verifier=oauth_log.code_verifier, redirect_uri=oauth_log.redirect_uri, expected_state=oauth_log.state, proxies=proxies), password
+    print(f"[{ts()}] [ERROR] OAuth 授权链路追踪失败 (最终停留在: {current_url})")
+    return None, None
 
-            if current_url.endswith("/consent") or current_url.endswith("/workspace"):
-                auth_cookie2 = s_log.cookies.get("oai-client-auth-session")
-                if auth_cookie2:
-                    workspaces = _decode_jwt_segment(auth_cookie2.split(".")[0]).get("workspaces") or []
-                    if workspaces:
-                        select_resp = _post_with_retry(
-                            s_log, 
-                            "https://auth.openai.com/api/accounts/workspace/select", 
-                            headers=_oai_headers(s_log.cookies.get("oai-did") or "", {"Referer": current_url, "content-type": "application/json"}), 
-                            json_body={"workspace_id": str(workspaces[0].get("id"))}, 
-                            proxies=proxies
-                        )
-                        final_url = _extract_next_url(select_resp.json()) if select_resp.status_code == 200 else ""
-                        _, final_loc = _follow_redirect_chain_local(s_log, final_url, proxies)
-                        if "code=" in final_loc:
-                            return submit_callback_url(callback_url=final_loc, expected_state=oauth_log.state, code_verifier=oauth_log.code_verifier, proxies=proxies), password
 
-        print(f"[{ts()}] [ERROR] OAuth 授权链路追踪失败 (最终停留在: {current_url})")
+
+def run(proxy: Optional[str]) -> tuple:
+    """调度器"""
+    processed_mails = set()
+    if proxy and proxy.startswith("socks5://"):
+        proxy = proxy.replace("socks5://", "socks5h://")
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    
+    try:
+        reg_status, reg_result = perform_registration(proxies, processed_mails)
+        
+        if reg_status == "fail":
+            return None, None
+        elif reg_status == "retry_403":
+            return "retry_403", None
+        elif reg_status == "done":
+            return reg_result
+        elif reg_status == "need_login":
+            email, password, email_jwt = reg_result
+            
+            wait_time = random.randint(LOGIN_DELAY_MIN, LOGIN_DELAY_MAX)
+            print(f"[{ts()}] [INFO] 注册通过，等待 {wait_time} 秒后发起静默登录...")
+            time.sleep(wait_time)
+            return perform_silent_login(email, password, email_jwt, proxies, processed_mails)
+            
         return None, None
-
+        
     except Exception as e:
         import traceback
         print(f"[{ts()}] [ERROR] 注册主流程发生严重异常: {e}")

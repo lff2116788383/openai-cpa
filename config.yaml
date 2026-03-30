@@ -119,6 +119,11 @@ use_proxy_for_email: false
 # 【开关】true 表示在控制台日志中隐藏邮箱域名，false 表示显示完整邮箱
 enable_email_masking: true
 
+
+#注册后等待多少秒在去拿tokens,默认是5-15秒之内
+login_delay_min: 5
+login_delay_max: 15
+
 # [Token 存放目录]
 # 默认存放跟脚本一个目录
 token_output_dir: ""
