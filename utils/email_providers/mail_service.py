@@ -541,6 +541,7 @@ def get_oai_code(
         proxies: Any = None,
         processed_mail_ids: set = None,
         pattern: str = OTP_CODE_PATTERN,
+        max_attempts: int = 20,
 ) -> str:
     """轮询各邮箱服务商收取 OpenAI 验证码，返回 6 位字符串或空串。"""
     mailbox_id = jwt
@@ -568,7 +569,7 @@ def get_oai_code(
             print(f"\n[{cfg.ts()}] [ERROR] IMAP 初始登录失败: {e}")
             mail_conn = None
 
-    for attempt in range(20):
+    for attempt in range(max_attempts):
         if getattr(cfg, 'GLOBAL_STOP', False): return ""
         try:
             if mode == "mail_curl":

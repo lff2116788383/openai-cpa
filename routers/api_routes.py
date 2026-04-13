@@ -13,8 +13,7 @@ import httpx
 from fastapi import APIRouter, Depends, Header, Query, Request, WebSocket, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
-from typing import List
-
+from typing import List, Optional
 from cloudflare import Cloudflare
 from utils import core_engine, db_manager
 from utils.config import reload_all_configs
@@ -22,7 +21,7 @@ from utils.integrations.sub2api_client import Sub2APIClient
 from utils.integrations.tg_notifier import send_tg_msg_async
 from utils.email_providers.gmail_oauth_handler import GmailOAuthHandler
 
-from global_state import VALID_TOKENS, CLUSTER_NODES, NODE_COMMANDS, cluster_lock, log_history, engine, verify_token
+from global_state import VALID_TOKENS, CLUSTER_NODES, NODE_COMMANDS, cluster_lock, log_history, engine, verify_token, worker_status
 import utils.config as cfg
 
 router = APIRouter()
@@ -74,6 +73,17 @@ class ClusterReportReq(BaseModel): node_name: str; secret: str; stats: dict; log
 
 class ClusterControlReq(BaseModel): node_name: str; action: str
 
+class ExtResultReq(BaseModel):
+    status: str
+    task_id: Optional[str] = ""
+    email: Optional[str] = ""
+    password: Optional[str] = ""
+    error_msg: Optional[str] = ""
+    token_data: Optional[str] = ""
+    callback_url: Optional[str] = ""
+    code_verifier: Optional[str] = ""
+    expected_state: Optional[str] = ""
+    error_type: Optional[str] = "failed"
 
 # ==========================================
 # 辅助函数
@@ -222,8 +232,8 @@ async def stop_task(token: str = Depends(verify_token)):
 async def get_stats(token: str = Depends(verify_token)):
     stats = core_engine.run_stats
     is_running = engine.is_running()
-
-    if is_running:
+    current_reg_mode = getattr(core_engine.cfg, 'REG_MODE', 'protocol')
+    if is_running or (current_reg_mode == 'extension' and stats["start_time"] > 0):
         elapsed = round(time.time() - stats["start_time"], 1) if stats.get("start_time", 0) > 0 else 0
         stats["_frozen_elapsed"] = elapsed
     else:
@@ -238,9 +248,11 @@ async def get_stats(token: str = Depends(verify_token)):
         progress_pct = min(100, round((stats["success"] / stats["target"]) * 100, 1))
     elif stats["success"] > 0:
         progress_pct = 100
-
-    current_mode = "CPA 仓管" if getattr(core_engine.cfg, 'ENABLE_CPA_MODE', False) else (
-        "Sub2Api 仓管" if getattr(core_engine.cfg, 'ENABLE_SUB2API_MODE', False) else "常规量产")
+    if current_reg_mode == 'extension':
+        current_mode = "插件托管 (古法)"
+    else:
+        current_mode = "CPA 仓管" if getattr(core_engine.cfg, 'ENABLE_CPA_MODE', False) else (
+            "Sub2Api 仓管" if getattr(core_engine.cfg, 'ENABLE_SUB2API_MODE', False) else "常规量产")
 
     return {
         "success": stats["success"], "failed": stats["failed"], "retries": stats["retries"],
@@ -333,16 +345,32 @@ async def add_wildcard_dns(req: CFSyncExistingReq, token: str = Depends(verify_t
                     zone_id = zone_data["result"][0]["id"]
 
                     records = [
-                        {"type": "MX", "name": "*", "content": "route3.mx.cloudflare.net", "priority": 36, "ttl": 300},
-                        {"type": "MX", "name": "*", "content": "route2.mx.cloudflare.net", "priority": 25, "ttl": 300},
-                        {"type": "MX", "name": "*", "content": "route1.mx.cloudflare.net", "priority": 51, "ttl": 300},
-                        {"type": "TXT", "name": "*", "content": '"v=spf1 include:_spf.mx.cloudflare.net ~all"',
-                         "ttl": 300}
+                        {"type": "MX", "name": "*", "content": "route3.mx.cloudflare.net", "priority": 36},
+                        {"type": "MX", "name": "*", "content": "route2.mx.cloudflare.net", "priority": 25},
+                        {"type": "MX", "name": "*", "content": "route1.mx.cloudflare.net", "priority": 51},
+                        {"type": "TXT", "name": "*", "content": '"v=spf1 include:_spf.mx.cloudflare.net ~all"'}
                     ]
                     for rec in records:
                         rec_resp = await client.post(
                             f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records", headers=headers,
                             json=rec)
+                        rec_data = rec_resp.json()
+                        if not rec_data.get("success"):
+                            errors = rec_data.get("errors", [])
+                            is_quota_exceeded = any(err.get("code") == 81045 for err in errors)
+                            is_exist = any(err.get("code") in {81057, 81058} for err in errors)
+
+                            if is_quota_exceeded:
+                                print(f"[{core_engine.ts()}] [CF] [{domain}] 记录配额已超出，无法继续创建，请手动去cf官网清除记录后在推送。")
+                                continue
+                            elif is_exist:
+                                print(f"[{core_engine.ts()}] [CF] [{domain}] 记录已存在无需重复创建。")
+                                continue
+
+                            print(f"[{core_engine.ts()}] [ERROR] [{domain}] 记录创建报错: {errors}")
+                        print(f"[{core_engine.ts()}] [SUCCESS] [{domain}] 创建成功")
+                        await asyncio.sleep(0.5)
+                    print(f"[{core_engine.ts()}] [CF] ✅ [{domain}] 解析处理成功，防止遗漏，请等待日志输出完毕后，重新点击推送！")
                     return True
                 except:
                     return False
@@ -818,7 +846,6 @@ async def cluster_view_ws(websocket: WebSocket, token: str = Query(None)):
     except Exception:
         pass
 
-
 @router.post("/api/cluster/upload_accounts")
 def cluster_upload_accounts(req: ClusterUploadAccountsReq):
     if req.secret != str(getattr(core_engine.cfg, '_c', {}).get("cluster_secret", "wenfxl666")).strip(): return {
@@ -836,3 +863,125 @@ def cluster_upload_accounts(req: ClusterUploadAccountsReq):
     except:
         pass
     return {"status": "success", "message": f"成功接收 {success_count} 个账号"}
+
+#模式二注册
+@router.get("/api/ext/generate_task")
+def ext_generate_task(token: str = Depends(verify_token)):
+    from utils.email_providers.mail_service import mask_email, get_email_and_token, clear_sticky_domain
+    from utils.register import _generate_password, generate_random_user_info, generate_oauth_url
+    import utils.config as cfg
+    import time
+    print(f"[{cfg.ts()}] [INFO] 正在进行插件古法注册模式，请稍后...")
+    try:
+        cfg.GLOBAL_STOP = False
+        clear_sticky_domain()
+
+        email = None
+        email_jwt = None
+        for attempt in range(3):
+            print(f"[{cfg.ts()}] [INFO] 正在进行邮箱创建...")
+            email, email_jwt = get_email_and_token(proxies=None)
+            if email:
+                break
+            time.sleep(1.5)
+
+        if not email:
+            return {"status": "error", "message": "邮箱获取超时或暂无库存，请稍候"}
+
+        user_info = generate_random_user_info()
+        password = _generate_password()
+
+        oauth_reg = generate_oauth_url()
+
+        print(f"[{cfg.ts()}] [INFO] （{mask_email(email)}）下发任务数据 (昵称: {user_info['name']}) (密码: {password}) (生日: {user_info['birthdate']})...")
+
+        name_parts = user_info['name'].split(' ')
+        return {
+            "status": "success",
+            "task_data": {
+                "email": email,
+                "email_jwt": email_jwt,
+                "password": password,
+                "firstName": name_parts[0] if len(name_parts) > 0 else "John",
+                "lastName": name_parts[1] if len(name_parts) > 1 else "Doe",
+                "birthday": user_info['birthdate'],
+                "registerUrl": oauth_reg.auth_url,
+                "code_verifier": oauth_reg.code_verifier,
+                "expected_state": oauth_reg.state
+            }
+        }
+    except Exception as e:
+        return {"status": "error", "message": f"任务生成失败: {str(e)}"}
+
+@router.get("/api/ext/get_mail_code")
+def ext_get_mail_code(email: str, email_jwt: str = "", type: str = "signup", max_attempts: int = 20, token: str = Depends(verify_token)):
+    from utils.email_providers.mail_service import get_oai_code
+    try:
+        code = get_oai_code(email, jwt=email_jwt, proxies=None, max_attempts=max_attempts)
+        if code:
+            return {"status": "success", "code": code}
+        return {"status": "pending"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@router.post("/api/ext/submit_result")
+def ext_submit_result(req: ExtResultReq, token: str = Depends(verify_token)):
+    from utils import core_engine
+    from utils.register import submit_callback_url
+
+    if req.status == "success":
+        token_json = req.token_data
+        if not token_json and req.callback_url:
+            try:
+                token_json = submit_callback_url(
+                    callback_url=req.callback_url,
+                    expected_state=req.expected_state,
+                    code_verifier=req.code_verifier
+                )
+            except Exception as e:
+                print(f"换取 Token 失败: {e}")
+                return {"status": "error", "message": "Token 换取失败"}
+        db_manager.save_account_to_db(req.email, req.password, token_json)
+        core_engine.run_stats['success'] = core_engine.run_stats.get('success', 0) + 1
+
+        return {"status": "success", "message": "战利品已入库"}
+    else:
+        core_engine.run_stats['failed'] = core_engine.run_stats.get('failed', 0) + 1
+        if req.error_type == 'phone_verify':
+            core_engine.run_stats['phone_verify'] = core_engine.run_stats.get('phone_verify', 0) + 1
+        elif req.error_type == 'pwd_blocked':
+            core_engine.run_stats['pwd_blocked'] = core_engine.run_stats.get('pwd_blocked', 0) + 1
+
+        return {"status": "success", "message": "异常统计已录入看板"}
+
+
+@router.post("/api/ext/heartbeat")
+def ext_heartbeat(worker_id: str, token: str = Depends(verify_token)):
+    worker_status[worker_id] = time.time()
+    return {"status": "success", "message": "ok"}
+
+
+@router.get("/api/ext/check_node")
+def check_node_status(worker_id: str, token: str = Depends(verify_token)):
+    last_seen = worker_status.get(worker_id)
+    if not last_seen:
+        return {"status": "success", "online": False, "reason": "never_connected"}
+    is_online = (time.time() - last_seen) < 15
+    return {
+        "status": "success",
+        "online": is_online,
+        "last_seen": last_seen
+    }
+
+@router.post("/api/ext/reset_stats")
+def ext_reset_stats(token: str = Depends(verify_token)):
+    from utils import core_engine
+    import time
+    core_engine.run_stats.update({
+        "success": 0, "failed": 0, "retries": 0,
+        "pwd_blocked": 0, "phone_verify": 0,
+        "start_time": time.time(),
+        "target": getattr(core_engine.cfg, 'NORMAL_TARGET_COUNT', 0)
+    })
+    return {"status": "success"}

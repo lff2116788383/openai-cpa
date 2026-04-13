@@ -194,6 +194,9 @@ CLUSTER_NODE_NAME: str = ""
 CLUSTER_MASTER_URL: str = ""
 CLUSTER_SECRET: str = "wenfxl666"
 
+REG_MODE: str = "protocol"
+
+
 def reload_all_configs():
     global _c
     global EMAIL_API_MODE, MAIL_DOMAINS, GPTMAIL_BASE, ADMIN_AUTH
@@ -230,7 +233,7 @@ def reload_all_configs():
     global DUCKMAIL_FORWARD_MODE, DUCKMAIL_FORWARD_EMAIL
     global DUCK_USE_PROXY
     global CLUSTER_NODE_NAME, CLUSTER_MASTER_URL, CLUSTER_SECRET
-
+    global REG_MODE
 
     def safe_int(value, default, minimum=None):
         try:
@@ -487,6 +490,7 @@ def reload_all_configs():
     CLUSTER_MASTER_URL = str(_c.get("cluster_master_url", "")).strip().rstrip("/")
     CLUSTER_SECRET = str(_c.get("cluster_secret", "wenfxl666")).strip()
 
+    REG_MODE = str(_c.get("reg_mode", "protocol")).strip().lower()
     reload_proxy_config()
     print(f"[{ts()}] [系统] 核心配置已完成同步。")
 
