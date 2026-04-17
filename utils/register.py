@@ -1211,6 +1211,30 @@ def run(proxy: Optional[str], run_ctx: dict = None) -> tuple:
                         if ok and next_url_or_reason:
                             print(f"[{cfg.ts()}] [INFO] （{mask_email(email)}） 手机验证成功，继续 OAuth 链路: {next_url_or_reason}")
 
+                            if next_url_or_reason.endswith("/about-you"):
+                                user_info = generate_random_user_info()
+                                print(f"[{cfg.ts()}] [INFO] （{mask_email(email)}）初始化账户信息 "
+                                      f"(昵称: {user_info['name']}, 生日: {user_info['birthdate']})...")
+
+                                sentinel_create = generate_payload(did=did, flow="create_account", proxy=proxy,
+                                                                   user_agent=current_ua,
+                                                                   impersonate="chrome110", ctx=log_ctx)
+                                create_headers = _oai_headers(did, {
+                                    "Referer": "https://auth.openai.com/about-you",
+                                    "content-type": "application/json",
+                                })
+
+                                if sentinel_create:
+                                    create_headers["openai-sentinel-token"] = sentinel_create
+
+                                create_account_resp = _post_with_retry(
+                                    s_log,
+                                    "https://auth.openai.com/api/accounts/create_account",
+                                    headers=create_headers,
+                                    json_body=user_info, proxies=proxies,
+                                )
+                                next_url_or_reason = str(create_account_resp.json().get("continue_url") or "").strip()
+
                             if "code=" in next_url_or_reason:
                                 return submit_callback_url(
                                     callback_url=next_url_or_reason,
