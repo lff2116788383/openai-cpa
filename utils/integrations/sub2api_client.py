@@ -2,7 +2,7 @@ import json
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 from utils import config as cfg
 from curl_cffi import requests as cffi_requests
 from utils.integrations.sub2api_proxy import parse_sub2api_proxy
@@ -47,7 +47,7 @@ def _build_account_extra(settings: Dict[str, Any]) -> Dict[str, Any]:
     return extra
 
 
-def _build_account_item(token_data: Dict[str, Any], settings: Dict[str, Any], proxy_obj: Dict[str, Any] | None) -> Dict[str, Any]:
+def _build_account_item(token_data: Dict[str, Any], settings: Dict[str, Any], proxy_obj: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     account_item = {
         "name": str(token_data.get("email", "unknown"))[:64],
         "platform": "openai",
@@ -81,7 +81,7 @@ def _build_account_item(token_data: Dict[str, Any], settings: Dict[str, Any], pr
 
 def build_sub2api_export_bundle(
     token_items: List[Dict[str, Any]],
-    settings: Dict[str, Any] | None = None,
+    settings: Optional[Dict[str, Any]] = None,
     *,
     rotate_missing_proxy: bool = False,
 ) -> Dict[str, Any]:
