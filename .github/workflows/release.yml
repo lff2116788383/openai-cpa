@@ -24,13 +24,28 @@ jobs:
           TAG_NAME=${GITHUB_REF#refs/tags/}
           [ "$TAG_NAME" == "$GITHUB_REF" ] && TAG_NAME="latest"
           ZIP_NAME="Wenfxl-Codex-Manager-${TAG_NAME}.zip"
-
-          zip -r $ZIP_NAME . \
-            -x "*.git*" -x "*.github*" -x "*__pycache__*" \
-            -x "data/*" -x "config.yaml" -x "*.env" \
-            -x "venv/*" -x ".idea/*" -x ".vscode/*"
-
+          zip -r $ZIP_NAME . -x "*.git*" -x "*.github*" -x "*__pycache__*" -x "data/*" -x "config.yaml" -x "*.env" -x "venv/*" -x ".idea/*" -x ".vscode/*"
           echo "ZIP_FILE=$ZIP_NAME" >> $GITHUB_ENV
+
+      - name: 🛠️ 自动生成日志
+        id: build_changelog
+        uses: mikepenz/release-changelog-builder-action@v4
+        with:
+          commitMode: true
+          configurationJson: |
+            {
+              "template": "${{ '{{' }}CHANGELOG${{ '}}' }}",
+              "categories": [
+                {
+                  "title": "## 📝 更新内容",
+                  "labels": ["*"]
+                }
+              ],
+              "ignore_helpers": false,
+              "content_template": "* ${TITLE} by @${AUTHOR} (${HASH})"
+            }
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: 发布到 GitHub Releases
         uses: softprops/action-gh-release@v2
@@ -38,10 +53,9 @@ jobs:
           files: ${{ env.ZIP_FILE }}
           name: "Wenfxl Codex Manager ${{ github.ref_name }}"
           body: |
-            欢迎使用最新版本！详细变更请见下方日志。
-
+            ${{ steps.build_changelog.outputs.changelog }}
             ---
             📦 **资源文件**: `${{ env.ZIP_FILE }}`
-          generate_release_notes: true
+          generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
